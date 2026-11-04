@@ -618,6 +618,14 @@ const MIN_ADJUSTED_MATCH_PROB = 0.01;
 // true  = hanya berlaku untuk mode otomatis karena AFK (tidak bergerak).
 // false = berlaku untuk semua mode otomatis, termasuk koneksi terputus.
 const AUTO_PENALTY_ONLY_AFK = false;
+// ── HUKUMAN LEVEL TAMBAH KARTU MODE OTOMATIS (di belakang layar, tidak ditampilkan ke pemain) ──
+// Selama mode otomatis aktif, level yang dipakai untuk undian rarity kartu dikurangi AUTO_LEVEL_PENALTY level
+// (minimal Lv1). Level asli (drawLevel) TIDAK berubah, jadi tampilan, log, kenaikan level, dan reset tetap normal.
+// Begitu mode otomatis nonaktif, hukuman ini langsung hilang. Ikut aturan AUTO_PENALTY_ONLY_AFK di atas.
+const AUTO_LEVEL_PENALTY = 3;
+// ── RESET LEVEL MODE OTOMATIS (sistem sungguhan, level di layar ikut reset) ──
+// Pemain manusia mode otomatis yang sudah di level ini: setelah SATU kali Tambah Kartu di level tersebut, level reset ke Lv1.
+const AUTO_RESET_AT_LEVEL = 12;
 // ── PENYESUAIAN PELUANG KARTU COCOK PER LEVEL BOT (di belakang layar) ──
 // Bot Lv1 di-nerf (-10 poin persen), Bot Lv2 normal, Bot Lv3 di-buff (+10 poin persen, maksimal 99%).
 const BOT_L1_MATCH_PENALTY = 0.10;
@@ -1085,8 +1093,8 @@ async function _runPool(items, limit, fn) {
     await Promise.all(workers);
 }
 // [MAHARAJA] Juara season = peringkat #1 di akhir season (rank tertinggi, lalu poin, lalu yang lebih dulu mencapainya),
-// dengan syarat minimal SEASON_CHAMPION_MIN_MATCHES pertandingan di season itu. Idempoten & aman dijalankan dua server.
-const SEASON_CHAMPION_MIN_MATCHES = 20;
+// Tanpa syarat minimal pertandingan (SEASON_CHAMPION_MIN_MATCHES = 0; isi angka lagi jika ingin syarat itu kembali). Idempoten & aman dijalankan dua server.
+const SEASON_CHAMPION_MIN_MATCHES = 0;
 async function _fbReadStrict(path) {
     const token = await fbGetToken();
     if (!token) throw new Error('Firebase token tidak tersedia');
@@ -1145,6 +1153,7 @@ async function seasonSweepIfNeeded() {
         if (!usersRes.ok) { console.error(`❌ seasonSweep gagal baca daftar user ${usersRes.status}`); return; }
         const uids = Object.keys((await usersRes.json()) || {});
         let resetCount = 0;
+        const _archivedSeasons = new Set(); // musim-musim yang rank akhirnya diarsipkan di sweep ini
         const lbBefore = (await fbRead('/leaderboard')) || {}; // untuk nama & waktu update (sebelum entri lama dibersihkan)
         await _runPool(uids, 6, async (uid) => {
             let archive = null;
@@ -1158,6 +1167,7 @@ async function seasonSweepIfNeeded() {
             });
             if (ok && archive) {
                 resetCount++;
+                _archivedSeasons.add(archive.seasonId);
                 await fbSet(`/users/${uid}/seasonHistory/${archive.seasonId}`, archive);
                 if (archive.seasonId >= 1 && !(archive.rankName === "Bronze III" && archive.points === 0)) {
                     const lbe = lbBefore[uid];
@@ -1177,7 +1187,17 @@ async function seasonSweepIfNeeded() {
             }
         });
         // [MAHARAJA] Semua rank akhir season lalu sudah tercatat di /seasonFinal → tetapkan juara. Jika gagal, sweep diulang.
-        await awardSeasonChampion(season.id - 1);
+        // [FIX] Tetapkan juara untuk SEMUA musim yang sudah berakhir dan punya catatan rank akhir, bukan hanya musim terakhir.
+        // Jika server tidak aktif selama beberapa musim, juara musim yang terlewat tetap ditetapkan. Aman diulang (juara yang sudah ada tidak ditulis ulang).
+        const _awardIds = new Set(_archivedSeasons);
+        _awardIds.add(season.id - 1);
+        try {
+            const sfRes = await fetch(`${FB_DB_URL}/seasonFinal.json?shallow=true`, { headers: { Authorization: `Bearer ${token}` } });
+            if (sfRes.ok) Object.keys((await sfRes.json()) || {}).forEach(k => _awardIds.add(Number(k)));
+        } catch (e) { console.error('⚠️ gagal baca daftar seasonFinal:', e); }
+        for (const sid of [..._awardIds].filter(n => Number.isInteger(n) && n >= 1 && n < season.id).sort((a, b) => a - b)) {
+            await awardSeasonChampion(sid);
+        }
         // Bersihkan papan peringkat: entri dari season lama dihapus (muncul lagi setelah pemain bermain di season baru)
         const lb = await fbRead('/leaderboard');
         const staleLb = Object.entries(lb || {}).filter(([uid, d]) => d && (d.seasonId || 0) !== season.id).map(([uid]) => uid);
@@ -1505,7 +1525,10 @@ class GameEngine {
         const useMatching = matchingCards.length > 0 && Math.random() < effectiveProb;
 
         const level = player.drawLevel ?? 1;
-        const rateTable = DRAW_RATES[level] ?? DRAW_RATES[1];
+        // [HUKUMAN MODE OTOMATIS] level efektif hanya untuk tabel peluang rarity; `level` asli dipakai untuk log & reset.
+        const _levelPenalized = !!player.autoMode && !player.isBot && (!AUTO_PENALTY_ONLY_AFK || player.autoReason === 'AFK');
+        const _effLevel = _levelPenalized ? Math.max(1, level - AUTO_LEVEL_PENALTY) : level;
+        const rateTable = DRAW_RATES[_effLevel] ?? DRAW_RATES[1];
 
         // Helper: pilih kartu terbaik dari pool berdasarkan rarity tertinggi yang tersedia (sesuai DRAW_RATES level)
         // Urutkan rarity dari tertinggi ke terendah berdasarkan nilai rate di level tersebut
@@ -1586,6 +1609,13 @@ class GameEngine {
             player.drawProb = 0;
             this.broadcastLog(`\uD83D\uDD04 ${player.name} Level Kartu reset ke Lv1 (dapat kartu tertinggi yang tersisa)!`);
             if (!player.isBot) this.sendToPlayer(player.id, { type: 'LOG', message: `\uD83D\uDD04 Kamu dapat [${resetReason}] (tertinggi)! Level Kartu reset ke Lv1.` });
+        } else if (level >= AUTO_RESET_AT_LEVEL && !!player.autoMode && !player.isBot) {
+            // [MODE OTOMATIS] sudah satu kali Tambah Kartu di Lv12 → reset ke Lv1 (sama seperti reset biasa: level, hitungan, peluang)
+            player.drawLevel = 1;
+            player.drawCount = 0;
+            player.drawProb = 0;
+            this.broadcastLog(`\uD83D\uDD04 ${player.name} Level Kartu reset ke Lv1 (mode otomatis, sudah tambah kartu di Lv${AUTO_RESET_AT_LEVEL})!`);
+            this.sendToPlayer(player.id, { type: 'LOG', message: `\uD83D\uDD04 Mode otomatis: Level Kartu reset ke Lv1 setelah tambah kartu di Lv${AUTO_RESET_AT_LEVEL}.` });
         }
         const probPct  = Math.round(prob * 100);
         const isMatch  = chosen.province === this.gs.currentProvince;
